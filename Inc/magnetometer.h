@@ -23,6 +23,13 @@ typedef struct {
  * or MAG_NONE. */
 MagType     mag_init(void);
 
+/* QMC5883L output data rate: 10, 50, 100 or 200 Hz (default 50). Applied at
+ * once if the sensor is detected, otherwise on the next mag_init(). The
+ * HMC5883L is read in single-measurement mode, so the rate does not apply
+ * to it. Returns 0, or -1 for an unsupported rate or an I2C error. */
+int         mag_set_rate(uint16_t hz);
+uint16_t    mag_rate(void);
+
 /* Type found by the last mag_init(); MAG_NONE after a failed read. */
 MagType     mag_type(void);
 

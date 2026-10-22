@@ -30,13 +30,51 @@ empty bus idles high.
 |---|---|
 | `scan` | Probe addresses 0x08-0x77 and print a map of the devices that answer |
 | `read` | Read the sensor once |
-| `start [N]` | Print a reading every N seconds (1-3600, default 1). The first one is printed immediately |
+| `start [N]` | Print a reading every N seconds (1-3600, default 1). `start 2s` also works. The first one is printed immediately |
+| `start Nms` | Print a reading every N milliseconds (5-3600000) |
 | `stop` | Stop printing readings |
+| `rate [HZ]` | Show or set the sensor's output rate: 10, 50, 100 or 200 Hz (default 50) |
 | `help` | Show the command list |
 
 `start` while already running changes the interval. Readings are printed on
 their own line and the prompt is redrawn after each one, so you can type
 `stop` while they are coming in.
+
+## Reading rate
+
+How often readings arrive depends on both settings:
+
+- **`start`:** how often the firmware takes a reading.
+- **`rate`:** how often the QMC5883L makes a new sample.
+
+With DRDY connected, each reading waits for a new sample. So if the interval
+is shorter than the sensor period, readings arrive at the sensor rate. For
+example, `start 10ms` at the default 50 Hz gives 50 readings/s, and `start`
+then prints a note saying so. To go faster, raise the sensor rate first:
+
+```
+> rate 200
+Sensor rate: 200 Hz
+> start 5ms
+```
+
+Measured on the test setup:
+
+| Sensor rate | Interval | Readings/s |
+|---|---|---|
+| 50 Hz | `start 20ms` | 50.3 |
+| 50 Hz | `start 10ms` | 50.3 |
+| 100 Hz | `start 10ms` | 100.3 |
+| 200 Hz | `start 5ms` | 198.7 |
+| 10 Hz | `start 5ms` | 10.0 |
+
+Each reading takes about 1-2 ms on the I2C bus, and a line of output is about
+75 bytes, so neither limits the rate. At 100-200 Hz the output is too fast to
+read by eye. Log it to a file instead, for example
+`picocom /dev/ttyACM0 --logfile mag.log`.
+
+The rate setting is kept in RAM and goes back to 50 Hz after a reset. The
+HMC5883L is read one measurement at a time, so `rate` does not apply to it.
 
 Example session:
 
@@ -80,7 +118,7 @@ which one is present when a reading is first requested:
 | Chip | Marking | Address | Identified by | Settings |
 |---|---|---|---|---|
 | HMC5883L | `L883` | 0x1E | ID registers 0x0A-0x0C = `H43` | Single measurement per reading, 8-sample average, ±1.3 Ga (1090 LSB/Ga) |
-| QMC5883L | `DA 5883` | 0x0D | Register 0x0D = 0xFF | Continuous, 50 Hz, OSR 512, ±2 G (12000 LSB/G) |
+| QMC5883L | `DA 5883` | 0x0D | Register 0x0D = 0xFF | Continuous at 10/50/100/200 Hz (default 50), OSR 512, ±2 G (12000 LSB/G) |
 
 ### QMC5883L clone quirks
 
@@ -173,14 +211,17 @@ make flash      # st-flash write to 0x08000000, then reset
 make clean
 ```
 
-The firmware builds to about 32 KB of flash and 26 KB of RAM.
+The firmware builds to about 33 KB of flash and 26 KB of RAM.
 
 ## Status
 
 Tested on a Black Pill (STM32F411CEU6) with a GY-273 module carrying a
 QMC5883L clone, with DRDY connected:
 
-- All commands work, including typing a command while readings are printing.
+- All commands work, including typing a command while readings are printing,
+  at every interval down to 5 ms.
+- Readings arrive at the expected rate at all four sensor rates (see
+  [Reading rate](#reading-rate)).
 - Readings are stable, and the total field of about 460-490 mG matches the
   Earth's field.
 - 300 of 300 back-to-back reads succeeded.

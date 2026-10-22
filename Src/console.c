@@ -10,7 +10,8 @@
 #include <stdlib.h>
 
 #define BANNER          "\r\nGY-273 Magnetometer Console\r\n"
-#define MAX_INTERVAL_S  3600
+#define MIN_INTERVAL_MS 5          /* 200 Hz, the fastest sensor rate */
+#define MAX_INTERVAL_MS 3600000    /* 1 hour */
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
@@ -22,7 +23,7 @@ static TickType_t s_next_sample;
 /* Transmit over USB CDC. Data is copied into s_tx_buf after the previous
    transfer has finished, so callers may pass stack buffers. */
 static void cdc_write_raw(const uint8_t *buf, uint32_t len) {
-    static uint8_t s_tx_buf[128];
+    static uint8_t s_tx_buf[256];
     while (len) {
         uint32_t n = len < sizeof(s_tx_buf) ? len : sizeof(s_tx_buf);
         /* Wait for previous transfer to complete (100 ms max). */
@@ -88,20 +89,15 @@ static int ensure_sensor(void) {
     return 1;
 }
 
-/* One reading as a single line:
-   X:   -123 Y:     45 Z:   -380 mG  |B|:   402 mG  heading: 159.8 deg */
-static void print_sample(void) {
-    if (!ensure_sensor())
-        return;
-
+/* Read the sensor and append one line to p:
+   X:   -123 Y:     45 Z:   -380 mG  |B|:   402 mG  heading: 159.8 deg
+   or an error message. The sensor must already be detected. */
+static char *fmt_sample(char *p) {
     MagSample s;
-    if (mag_read(&s) != 0) {
-        cdc_write("Error: sensor read failed\r\n");
-        return;
-    }
+    if (mag_read(&s) != 0)
+        return fmt_str(p, "Error: sensor read failed\r\n");
 
-    char buf[96];
-    char *p = fmt_str(buf, "X:");
+    p = fmt_str(p, "X:");
     p = fmt_int(p, s.x_mg, 7);
     p = fmt_str(p, " Y:");
     p = fmt_int(p, s.y_mg, 7);
@@ -116,18 +112,42 @@ static void print_sample(void) {
     p = fmt_str(p, " deg");
     if (s.overflow)
         p = fmt_str(p, "  OVERFLOW");
-    p = fmt_str(p, "\r\n");
-    *p = '\0';
+    return fmt_str(p, "\r\n");
+}
+
+static void print_sample(void) {
+    if (!ensure_sensor())
+        return;
+    char buf[96];
+    *fmt_sample(buf) = '\0';
     cdc_write(buf);
 }
 
 /* Print a streamed reading without mangling the line being typed: erase the
-   prompt, print the reading, then redraw the prompt and the partial input. */
+   prompt, print the reading, then redraw the prompt and the partial input.
+   All of it goes out in one write to keep up at high rates. */
 static void stream_sample(void) {
-    cdc_write("\r\x1b[K");
-    print_sample();
-    cdc_write("> ");
-    cdc_write_raw((const uint8_t *)s_line, (uint32_t)s_pos);
+    if (mag_type() == MAG_NONE) {
+        cdc_write("\r\x1b[K");
+        ensure_sensor();
+        cdc_write("> ");
+        cdc_write_raw((const uint8_t *)s_line, (uint32_t)s_pos);
+        return;
+    }
+    char buf[96 + sizeof(s_line) + 8];
+    char *p = fmt_str(buf, "\r\x1b[K");
+    p = fmt_sample(p);
+    p = fmt_str(p, "> ");
+    memcpy(p, s_line, (size_t)s_pos);
+    p += s_pos;
+    cdc_write_raw((const uint8_t *)buf, (uint32_t)(p - buf));
+}
+
+/* Append an interval as "3 s" or "250 ms". */
+static char *fmt_interval(char *p, uint32_t ms) {
+    if (ms % 1000 == 0)
+        return fmt_str(fmt_int(p, (int32_t)(ms / 1000), 0), " s");
+    return fmt_str(fmt_int(p, (int32_t)ms, 0), " ms");
 }
 
 static void cmd_scan(void) {
@@ -162,28 +182,75 @@ static void cmd_scan(void) {
     }
 }
 
+/* start [N | Ns | Nms]: N alone is seconds */
 static void cmd_start(const char *arg) {
-    long secs = 1;
+    long ms = 1000;
     while (*arg == ' ') arg++;
     if (*arg) {
         char *end;
-        secs = strtol(arg, &end, 10);
+        long n = strtol(arg, &end, 10);
+        int  ok = end != arg;
         while (*end == ' ') end++;
-        if (end == arg || *end != '\0' || secs < 1 || secs > MAX_INTERVAL_S) {
-            cdc_write("Usage: start [N]   N = interval in seconds, 1-3600\r\n");
+        if (strcmp(end, "ms") == 0)
+            ms = n;
+        else if (*end == '\0' || strcmp(end, "s") == 0)
+            ms = n * 1000;
+        else
+            ok = 0;
+        if (!ok || n < 1 || ms < MIN_INTERVAL_MS || ms > MAX_INTERVAL_MS) {
+            cdc_write("Usage: start [N]     every N seconds (1-3600)\r\n"
+                      "       start Nms     every N milliseconds (5-3600000)\r\n");
             return;
         }
     }
     if (!ensure_sensor())
         return;
 
-    s_interval    = pdMS_TO_TICKS((uint32_t)secs * 1000U);
+    s_interval    = pdMS_TO_TICKS((uint32_t)ms);
     s_next_sample = xTaskGetTickCount();   /* first reading right away */
 
-    char buf[48];
+    char buf[160];
     char *p = fmt_str(buf, "Printing every ");
-    p = fmt_int(p, (int32_t)secs, 0);
-    p = fmt_str(p, " s. Type 'stop' to stop.\r\n");
+    p = fmt_interval(p, (uint32_t)ms);
+    p = fmt_str(p, ". Type 'stop' to stop.\r\n");
+    uint32_t period_ms = 1000U / mag_rate();
+    if (mag_type() == MAG_QMC5883L && (uint32_t)ms < period_ms) {
+        p = fmt_str(p, "Note: at ");
+        p = fmt_int(p, mag_rate(), 0);
+        p = fmt_str(p, " Hz the sensor has a new sample every ");
+        p = fmt_int(p, (int32_t)period_ms, 0);
+        p = fmt_str(p, mag_drdy_ok() ? " ms, readings wait for it.\r\n"
+                                     : " ms, readings repeat.\r\n");
+        p = fmt_str(p, "Use 'rate' to make it faster.\r\n");
+    }
+    *p = '\0';
+    cdc_write(buf);
+}
+
+static void cmd_rate(const char *arg) {
+    while (*arg == ' ') arg++;
+    if (*arg) {
+        char *end;
+        long hz = strtol(arg, &end, 10);
+        while (*end == ' ') end++;
+        if (end == arg || *end != '\0' ||
+            (hz != 10 && hz != 50 && hz != 100 && hz != 200)) {
+            cdc_write("Usage: rate [10|50|100|200]\r\n");
+            return;
+        }
+        if (mag_set_rate((uint16_t)hz) != 0) {
+            cdc_write("Error: could not write the rate to the sensor\r\n");
+            return;
+        }
+    }
+
+    char buf[96];
+    char *p = fmt_str(buf, "Sensor rate: ");
+    p = fmt_int(p, mag_rate(), 0);
+    p = fmt_str(p, " Hz");
+    if (mag_type() == MAG_HMC5883L)
+        p = fmt_str(p, " (not used: the HMC5883L measures on each reading)");
+    p = fmt_str(p, "\r\n");
     *p = '\0';
     cdc_write(buf);
 }
@@ -197,7 +264,9 @@ static void process_command(const char *line) {
                   "  scan        scan the I2C bus (PB6 = SCL, PB7 = SDA)\r\n"
                   "  read        read the sensor once\r\n"
                   "  start [N]   print readings every N seconds (1-3600, default 1)\r\n"
+                  "  start Nms   print readings every N milliseconds (5-3600000)\r\n"
                   "  stop        stop printing readings\r\n"
+                  "  rate [HZ]   show or set the sensor rate: 10, 50, 100, 200 Hz\r\n"
                   "  help        this help\r\n");
         return;
     }
@@ -214,6 +283,11 @@ static void process_command(const char *line) {
 
     if (strcmp(line, "start") == 0 || strncmp(line, "start ", 6) == 0) {
         cmd_start(line + 5);
+        return;
+    }
+
+    if (strcmp(line, "rate") == 0 || strncmp(line, "rate ", 5) == 0) {
+        cmd_rate(line + 4);
         return;
     }
 
@@ -246,8 +320,13 @@ void ConsoleTask(void *pvParam) {
             int32_t    left = (int32_t)(s_next_sample - now);
             if (left <= 0) {
                 stream_sample();
+                /* The reading itself can take up to a sensor period (it
+                   waits for DRDY), so compare against the time after it.
+                   If behind, skip ahead instead of reading back to back,
+                   so typed commands are still handled. */
+                now = xTaskGetTickCount();
                 s_next_sample += s_interval;
-                if ((int32_t)(s_next_sample - now) <= 0)   /* fell behind */
+                if ((int32_t)(s_next_sample - now) <= 0)
                     s_next_sample = now + s_interval;
                 continue;
             }

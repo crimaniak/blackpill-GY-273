@@ -28,11 +28,19 @@
 #define QMC_CTRL1          0x09
 #define QMC_CTRL2          0x0A
 #define QMC_SET_RESET      0x0B
+#define QMC_CTRL1_BASE     0x01   /* OSR 512, +-2 G, continuous; ODR in bits 3:2 */
 #define QMC_ID             0x0D   /* reads 0xFF */
 #define QMC_LSB_PER_GAUSS  12000  /* +-2 G range */
 
 static MagType s_type = MAG_NONE;
 static int     s_drdy_ok;   /* DRDY line seen working by mag_init() */
+static uint8_t s_odr = 1;   /* QMC5883L ODR field: 0 = 10, 1 = 50, 2 = 100, 3 = 200 Hz */
+
+static const uint16_t qmc_rates[] = {10, 50, 100, 200};
+
+static uint8_t qmc_ctrl1(void) {
+    return (uint8_t)(QMC_CTRL1_BASE | s_odr << 2);
+}
 
 /* After a timeout the I2C peripheral is left with BUSY set and every later
    transfer fails until the bus is reset, so reset it right away. A NACK
@@ -77,7 +85,7 @@ static int qmc_setup(void) {
     if (rd(MAG_QMC5883L_ADDR, QMC_ID, &id, 1) != 0 || id != 0xFF)
         return -1;
     /* Soft reset, SET/RESET period 0x01 as the datasheet recommends, then
-       CTRL1: OSR 512, +-2 G, 50 Hz, continuous. A chip that was already
+       CTRL1: OSR 512, +-2 G, continuous at the set rate. A chip that was already
        measuring takes more than 5 ms to accept writes after the reset, so
        retry for up to 50 ms and confirm by reading CTRL1 back. */
     if (wr(MAG_QMC5883L_ADDR, QMC_CTRL2, 0x80) != 0)
@@ -86,8 +94,8 @@ static int qmc_setup(void) {
         HAL_Delay(2);
         uint8_t ctrl1;
         if (wr(MAG_QMC5883L_ADDR, QMC_SET_RESET, 0x01) == 0 &&
-            wr(MAG_QMC5883L_ADDR, QMC_CTRL1, 0x05) == 0 &&
-            rd(MAG_QMC5883L_ADDR, QMC_CTRL1, &ctrl1, 1) == 0 && ctrl1 == 0x05)
+            wr(MAG_QMC5883L_ADDR, QMC_CTRL1, qmc_ctrl1()) == 0 &&
+            rd(MAG_QMC5883L_ADDR, QMC_CTRL1, &ctrl1, 1) == 0 && ctrl1 == qmc_ctrl1())
             return 0;
     }
     return -1;
@@ -172,6 +180,24 @@ MagType mag_init(void) {
         }
     }
     return s_type;
+}
+
+int mag_set_rate(uint16_t hz) {
+    for (uint8_t i = 0; i < sizeof(qmc_rates) / sizeof(qmc_rates[0]); i++) {
+        if (qmc_rates[i] != hz)
+            continue;
+        s_odr = i;
+        if (s_type == MAG_QMC5883L && wr(MAG_QMC5883L_ADDR, QMC_CTRL1, qmc_ctrl1()) != 0) {
+            s_type = MAG_NONE;   /* detect and configure again on next use */
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+uint16_t mag_rate(void) {
+    return qmc_rates[s_odr];
 }
 
 int mag_drdy_ok(void) {
