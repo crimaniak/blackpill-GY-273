@@ -1,0 +1,15 @@
+[submodule "Middlewares/FreeRTOS"]
+	path = Middlewares/FreeRTOS
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+[submodule "Drivers/stm32f4xx-hal-driver"]
+	path = Drivers/stm32f4xx-hal-driver
+	url = https://github.com/STMicroelectronics/stm32f4xx-hal-driver.git
+[submodule "Middlewares/stm32_mw_usb_device"]
+	path = Middlewares/stm32_mw_usb_device
+	url = https://github.com/STMicroelectronics/stm32_mw_usb_device.git
+[submodule "Drivers/cmsis-core"]
+	path = Drivers/cmsis-core
+	url = https://github.com/STMicroelectronics/cmsis-core.git
+[submodule "Drivers/cmsis-device-f4"]
+	path = Drivers/cmsis-device-f4
+	url = https://github.com/STMicroelectronics/cmsis-device-f4.git
