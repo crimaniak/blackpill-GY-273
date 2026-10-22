@@ -1,6 +1,9 @@
 #include "console.h"
 #include "i2c_bus.h"
-#include "magnetometer.h"
+#include "i2c_magnetometer.h"
+#include "mag_compass.h"
+#include "mag_driver.h"
+#include "mag_port_stm32_hal.h"
 #include "usbd_cdc_if.h"
 #include "usbd_cdc.h"
 #include "stm32f4xx_hal.h"
@@ -19,6 +22,16 @@ static char       s_line[64];       /* command line being typed */
 static int        s_pos;
 static TickType_t s_interval;       /* streaming period in ticks, 0 = stopped */
 static TickType_t s_next_sample;
+
+/* Magnetometer on I2C1, DRDY on PB5 */
+static mag_stm32_port_t s_port = {
+    .hi2c      = &g_i2c,
+    .drdy_port = GPIOB,
+    .drdy_pin  = GPIO_PIN_5,
+    .recover   = i2c_bus_init,   /* also frees a slave holding SDA low */
+};
+static mag_bus_t s_bus;
+static mag_dev_t s_mag;
 
 /* Transmit over USB CDC. Data is copied into s_tx_buf after the previous
    transfer has finished, so callers may pass stack buffers. */
@@ -68,22 +81,51 @@ static char *fmt_hex8(char *p, uint8_t v) {
     return p;
 }
 
+/* Append v with up to 2 decimals: "50", "7.5", "0.75" */
+static char *fmt_dec2(char *p, float v) {
+    int32_t c = (int32_t)(v * 100.0f + 0.5f);
+    p = fmt_int(p, c / 100, 0);
+    if (c % 100) {
+        *p++ = '.';
+        *p++ = (char)('0' + c % 100 / 10);
+        if (c % 10)
+            *p++ = (char)('0' + c % 10);
+    }
+    return p;
+}
+
+static int32_t round_i32(float v) {
+    return (int32_t)(v < 0 ? v - 0.5f : v + 0.5f);
+}
+
+/* Name of a chip the library knows at this address, or NULL */
+static const char *known_chip(uint8_t addr) {
+    for (const mag_driver_t *const *d = mag_builtin_drivers; *d; d++)
+        for (int i = 0; i < (int)sizeof((*d)->addrs) && (*d)->addrs[i]; i++)
+            if ((*d)->addrs[i] == addr)
+                return (*d)->name;
+    return NULL;
+}
+
 /* Detect the sensor if needed. Returns 1 when one is ready. */
 static int ensure_sensor(void) {
-    if (mag_type() != MAG_NONE)
+    if (!s_bus.read) {
+        mag_port_stm32_init(&s_port, &s_bus);
+        mag_init(&s_mag, &s_bus);
+    }
+    if (s_mag.drv)
         return 1;
-    MagType t = mag_init();
-    if (t == MAG_NONE) {
-        cdc_write("Error: no HMC5883L (0x1E) or QMC5883L (0x0D) found. "
+    if (mag_detect(&s_mag, NULL) != MAG_OK) {
+        cdc_write("Error: no supported magnetometer found. "
                   "Check wiring, try 'scan'.\r\n");
         return 0;
     }
     char buf[96];
     char *p = fmt_str(buf, "Sensor: ");
-    p = fmt_str(p, mag_name(t));
+    p = fmt_str(p, mag_chip_name(&s_mag));
     p = fmt_str(p, " at ");
-    p = fmt_hex8(p, mag_addr(t));
-    p = fmt_str(p, mag_drdy_ok() ? ", DRDY on PB5 ok\r\n" : ", no signal on DRDY (PB5)\r\n");
+    p = fmt_hex8(p, s_mag.addr);
+    p = fmt_str(p, s_mag.drdy_ok ? ", DRDY on PB5 ok\r\n" : ", no signal on DRDY (PB5)\r\n");
     *p = '\0';
     cdc_write(buf);
     return 1;
@@ -93,24 +135,30 @@ static int ensure_sensor(void) {
    X:   -123 Y:     45 Z:   -380 mG  |B|:   402 mG  heading: 159.8 deg
    or an error message. The sensor must already be detected. */
 static char *fmt_sample(char *p) {
-    MagSample s;
-    if (mag_read(&s) != 0)
-        return fmt_str(p, "Error: sensor read failed\r\n");
+    mag_sample_t s;
+    int err = mag_read(&s_mag, &s);
+    if (err != MAG_OK) {
+        p = fmt_str(p, "Error: ");
+        p = fmt_str(p, mag_strerror(err));
+        return fmt_str(p, "\r\n");
+    }
 
+    /* 1 uT = 10 mG */
+    int32_t heading_d10 = round_i32(mag_heading_deg(&s, 0.0f) * 10.0f) % 3600;
     p = fmt_str(p, "X:");
-    p = fmt_int(p, s.x_mg, 7);
+    p = fmt_int(p, round_i32(s.x * 10.0f), 7);
     p = fmt_str(p, " Y:");
-    p = fmt_int(p, s.y_mg, 7);
+    p = fmt_int(p, round_i32(s.y * 10.0f), 7);
     p = fmt_str(p, " Z:");
-    p = fmt_int(p, s.z_mg, 7);
+    p = fmt_int(p, round_i32(s.z * 10.0f), 7);
     p = fmt_str(p, " mG  |B|:");
-    p = fmt_int(p, s.total_mg, 6);
+    p = fmt_int(p, round_i32(mag_field_ut(&s) * 10.0f), 6);
     p = fmt_str(p, " mG  heading:");
-    p = fmt_int(p, s.heading_d10 / 10, 4);
+    p = fmt_int(p, heading_d10 / 10, 4);
     *p++ = '.';
-    *p++ = (char)('0' + s.heading_d10 % 10);
+    *p++ = (char)('0' + heading_d10 % 10);
     p = fmt_str(p, " deg");
-    if (s.overflow)
+    if (s.flags & MAG_FLAG_OVERFLOW)
         p = fmt_str(p, "  OVERFLOW");
     return fmt_str(p, "\r\n");
 }
@@ -127,7 +175,7 @@ static void print_sample(void) {
    prompt, print the reading, then redraw the prompt and the partial input.
    All of it goes out in one write to keep up at high rates. */
 static void stream_sample(void) {
-    if (mag_type() == MAG_NONE) {
+    if (!s_mag.drv) {
         cdc_write("\r\x1b[K");
         ensure_sensor();
         cdc_write("> ");
@@ -170,12 +218,14 @@ static void cmd_scan(void) {
     *p = '\0';
     cdc_write(buf);
     for (int i = 0; i < n && i < (int)sizeof(found); i++) {
+        const char *name = known_chip(found[i]);
         p = fmt_str(buf, "  ");
         p = fmt_hex8(p, found[i]);
-        if (found[i] == MAG_HMC5883L_ADDR)
-            p = fmt_str(p, "  HMC5883L magnetometer");
-        else if (found[i] == MAG_QMC5883L_ADDR)
-            p = fmt_str(p, "  QMC5883L magnetometer");
+        if (name) {
+            p = fmt_str(p, "  ");
+            p = fmt_str(p, name);
+            p = fmt_str(p, " magnetometer?");
+        }
         p = fmt_str(p, "\r\n");
         *p = '\0';
         cdc_write(buf);
@@ -213,44 +263,48 @@ static void cmd_start(const char *arg) {
     char *p = fmt_str(buf, "Printing every ");
     p = fmt_interval(p, (uint32_t)ms);
     p = fmt_str(p, ". Type 'stop' to stop.\r\n");
-    uint32_t period_ms = 1000U / mag_rate();
-    if (mag_type() == MAG_QMC5883L && (uint32_t)ms < period_ms) {
+    uint32_t period_ms = (uint32_t)(1000.0f / s_mag.cfg.rate_hz);
+    if (s_mag.cfg.mode == MAG_MODE_CONTINUOUS && (uint32_t)ms < period_ms) {
         p = fmt_str(p, "Note: at ");
-        p = fmt_int(p, mag_rate(), 0);
+        p = fmt_dec2(p, s_mag.cfg.rate_hz);
         p = fmt_str(p, " Hz the sensor has a new sample every ");
         p = fmt_int(p, (int32_t)period_ms, 0);
-        p = fmt_str(p, mag_drdy_ok() ? " ms, readings wait for it.\r\n"
-                                     : " ms, readings repeat.\r\n");
+        p = fmt_str(p, s_mag.drdy_ok || s_mag.drv->data_ready ? " ms, readings wait for it.\r\n"
+                                                              : " ms, readings repeat.\r\n");
         p = fmt_str(p, "Use 'rate' to make it faster.\r\n");
     }
     *p = '\0';
     cdc_write(buf);
 }
 
+/* rate [HZ]: the sensor uses the closest rate it supports */
 static void cmd_rate(const char *arg) {
     while (*arg == ' ') arg++;
+    if (!ensure_sensor())
+        return;
     if (*arg) {
         char *end;
         long hz = strtol(arg, &end, 10);
         while (*end == ' ') end++;
-        if (end == arg || *end != '\0' ||
-            (hz != 10 && hz != 50 && hz != 100 && hz != 200)) {
-            cdc_write("Usage: rate [10|50|100|200]\r\n");
+        if (end == arg || *end != '\0' || hz < 1 || hz > 1000) {
+            cdc_write("Usage: rate [HZ]   HZ = 1-1000, the closest supported rate is used\r\n");
             return;
         }
-        if (mag_set_rate((uint16_t)hz) != 0) {
-            cdc_write("Error: could not write the rate to the sensor\r\n");
+        mag_config_t cfg = s_mag.req;
+        cfg.rate_hz = (float)hz;
+        int err = mag_configure(&s_mag, &cfg);
+        if (err != MAG_OK) {
+            cdc_write("Error: ");
+            cdc_write(mag_strerror(err));
+            cdc_write("\r\n");
             return;
         }
     }
 
     char buf[96];
     char *p = fmt_str(buf, "Sensor rate: ");
-    p = fmt_int(p, mag_rate(), 0);
-    p = fmt_str(p, " Hz");
-    if (mag_type() == MAG_HMC5883L)
-        p = fmt_str(p, " (not used: the HMC5883L measures on each reading)");
-    p = fmt_str(p, "\r\n");
+    p = fmt_dec2(p, s_mag.cfg.rate_hz);
+    p = fmt_str(p, s_mag.drdy_ok ? " Hz\r\n" : " Hz, no signal on DRDY (PB5)\r\n");
     *p = '\0';
     cdc_write(buf);
 }
@@ -266,7 +320,7 @@ static void process_command(const char *line) {
                   "  start [N]   print readings every N seconds (1-3600, default 1)\r\n"
                   "  start Nms   print readings every N milliseconds (5-3600000)\r\n"
                   "  stop        stop printing readings\r\n"
-                  "  rate [HZ]   show or set the sensor rate: 10, 50, 100, 200 Hz\r\n"
+                  "  rate [HZ]   show or set the sensor rate (closest supported)\r\n"
                   "  help        this help\r\n");
         return;
     }

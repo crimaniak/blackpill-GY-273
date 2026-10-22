@@ -13,3 +13,6 @@
 [submodule "Drivers/cmsis-device-f4"]
 	path = Drivers/cmsis-device-f4
 	url = https://github.com/STMicroelectronics/cmsis-device-f4.git
+[submodule "Lib/i2c_magnetometer"]
+	path = Lib/i2c_magnetometer
+	url = https://github.com/crimaniak/i2c_magnetometer.git

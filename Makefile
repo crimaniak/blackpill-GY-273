@@ -8,6 +8,9 @@ HAL_DRV    := $(ROOT)/Drivers/stm32f4xx-hal-driver
 FREERTOS   := $(ROOT)/Middlewares/FreeRTOS
 USB_LIB    := $(ROOT)/Middlewares/stm32_mw_usb_device
 
+I2C_MAGNETOMETER_DIR ?= $(ROOT)/Lib/i2c_magnetometer
+include $(I2C_MAGNETOMETER_DIR)/i2c_magnetometer.mk
+
 CC       := arm-none-eabi-gcc
 OBJCOPY  := arm-none-eabi-objcopy
 
@@ -18,12 +21,13 @@ INCLUDES := -I$(ROOT)/Inc \
             -I$(USB_LIB)/Class/CDC/Inc \
             -I$(CMSIS)/Include \
             -I$(CMSIS_CORE) \
-            -I$(HAL_DRV)/Inc
+            -I$(HAL_DRV)/Inc \
+            $(I2C_MAGNETOMETER_INCLUDES)
 
 DEFS     := -DSTM32F411xE -DUSE_HAL_DRIVER
 
 ARCH     := -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
-CFLAGS   := $(ARCH) -O2 -ffreestanding -fno-math-errno \
+CFLAGS   := $(ARCH) -O2 -ffreestanding \
             -ffunction-sections -fdata-sections \
             $(INCLUDES) $(DEFS)
 
@@ -41,8 +45,7 @@ PROJ_SRCS := $(ROOT)/Src/main.c \
              $(ROOT)/Src/usbd_desc.c \
              $(ROOT)/Src/usbd_cdc_if.c \
              $(ROOT)/Src/console.c \
-             $(ROOT)/Src/i2c_bus.c \
-             $(ROOT)/Src/magnetometer.c
+             $(ROOT)/Src/i2c_bus.c
 
 HAL_SRCS := $(HAL_DRV)/Src/stm32f4xx_hal.c \
             $(HAL_DRV)/Src/stm32f4xx_hal_cortex.c \
@@ -72,7 +75,9 @@ USB_SRCS := $(USB_LIB)/Core/Src/usbd_core.c \
 
 CMSIS_SRCS := $(CMSIS)/Source/Templates/system_stm32f4xx.c
 
-C_SRCS   := $(PROJ_SRCS) $(HAL_SRCS) $(RTOS_SRCS) $(USB_SRCS) $(CMSIS_SRCS)
+MAG_SRCS := $(I2C_MAGNETOMETER_SRCS) $(I2C_MAGNETOMETER_STM32_HAL_SRCS)
+
+C_SRCS   := $(PROJ_SRCS) $(HAL_SRCS) $(RTOS_SRCS) $(USB_SRCS) $(CMSIS_SRCS) $(MAG_SRCS)
 ASM_SRCS := $(CMSIS)/Source/Templates/gcc/startup_stm32f411xe.s
 
 C_OBJS   := $(addprefix $(BUILD)/, $(notdir $(C_SRCS:.c=.o)))
@@ -87,7 +92,8 @@ VPATH := $(ROOT)/Src \
          $(USB_LIB)/Core/Src \
          $(USB_LIB)/Class/CDC/Src \
          $(CMSIS)/Source/Templates \
-         $(CMSIS)/Source/Templates/gcc
+         $(CMSIS)/Source/Templates/gcc \
+         $(I2C_MAGNETOMETER_SRC_DIRS)
 
 .PHONY: all flash clean size
 
