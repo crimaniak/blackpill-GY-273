@@ -16,3 +16,6 @@
 [submodule "Lib/i2c_magnetometer"]
 	path = Lib/i2c_magnetometer
 	url = https://github.com/crimaniak/i2c_magnetometer.git
+[submodule "Lib/stm32-ssd1306"]
+	path = Lib/stm32-ssd1306
+	url = https://github.com/afiskon/stm32-ssd1306.git

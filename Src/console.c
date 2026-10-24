@@ -1,4 +1,6 @@
 #include "console.h"
+#include "display.h"
+#include "fmt.h"
 #include "i2c_bus.h"
 #include "i2c_magnetometer.h"
 #include "mag_compass.h"
@@ -22,6 +24,10 @@
 #define CAL_REPORT_MS   1000       /* progress line once a second */
 #define CAL_MIN_COVER   60         /* % of a full turn each axis must see */
 
+#define DISPLAY_MS      200        /* display refresh, 5 per second */
+#define DETECT_RETRY_MS 1000       /* look for a missing sensor this often */
+#define DISPLAY_RETRY_MS 2000      /* look for a missing display this often */
+
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 static char       s_line[64];       /* command line being typed */
@@ -38,6 +44,15 @@ static mag_stm32_port_t s_port = {
 };
 static mag_bus_t s_bus;
 static mag_dev_t s_mag;
+static int        s_announced;       /* "Sensor: ..." printed to the terminal */
+static TickType_t s_next_detect;
+
+/* Last good reading, shared with the display */
+static mag_sample_t s_last;
+static int          s_have_last;
+static TickType_t   s_last_tick;
+static TickType_t   s_next_display;
+static int          s_display;         /* display found and initialised */
 
 /* Calibration in progress (cal start) */
 static int                 s_cal_active;
@@ -67,49 +82,6 @@ static void cdc_write(const char *s) {
     cdc_write_raw((const uint8_t *)s, (uint32_t)strlen(s));
 }
 
-/* Append v right-aligned in a field of width chars; returns the new end. */
-static char *fmt_int(char *p, int32_t v, int width) {
-    char tmp[12];
-    int  n = 0;
-    uint32_t u = v < 0 ? (uint32_t)-v : (uint32_t)v;
-    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
-    if (v < 0) tmp[n++] = '-';
-    for (int i = n; i < width; i++) *p++ = ' ';
-    while (n) *p++ = tmp[--n];
-    return p;
-}
-
-static char *fmt_str(char *p, const char *s) {
-    while (*s) *p++ = *s++;
-    return p;
-}
-
-static char *fmt_hex8(char *p, uint8_t v) {
-    static const char hex[] = "0123456789ABCDEF";
-    *p++ = '0';
-    *p++ = 'x';
-    *p++ = hex[v >> 4];
-    *p++ = hex[v & 0xF];
-    return p;
-}
-
-/* Append v with up to 2 decimals: "50", "7.5", "0.75" */
-static char *fmt_dec2(char *p, float v) {
-    int32_t c = (int32_t)(v * 100.0f + 0.5f);
-    p = fmt_int(p, c / 100, 0);
-    if (c % 100) {
-        *p++ = '.';
-        *p++ = (char)('0' + c % 100 / 10);
-        if (c % 10)
-            *p++ = (char)('0' + c % 10);
-    }
-    return p;
-}
-
-static int32_t round_i32(float v) {
-    return (int32_t)(v < 0 ? v - 0.5f : v + 0.5f);
-}
-
 /* Name of a chip the library knows at this address, or NULL */
 static const char *known_chip(uint8_t addr) {
     for (const mag_driver_t *const *d = mag_builtin_drivers; *d; d++)
@@ -119,19 +91,33 @@ static const char *known_chip(uint8_t addr) {
     return NULL;
 }
 
-/* Detect the sensor if needed. Returns 1 when one is ready. */
-static int ensure_sensor(void) {
+/* Detect the sensor if needed, without printing. With force = 0 a missing
+   sensor is looked for at most once per DETECT_RETRY_MS. */
+static int sensor_ready(int force) {
     if (!s_bus.read) {
         mag_port_stm32_init(&s_port, &s_bus);
         mag_init(&s_mag, &s_bus);
     }
     if (s_mag.drv)
         return 1;
-    if (mag_detect(&s_mag, NULL) != MAG_OK) {
+    TickType_t now = xTaskGetTickCount();
+    if (!force && (int32_t)(s_next_detect - now) > 0)
+        return 0;
+    s_next_detect = now + pdMS_TO_TICKS(DETECT_RETRY_MS);
+    return mag_detect(&s_mag, NULL) == MAG_OK;
+}
+
+/* Detect the sensor if needed. Returns 1 when one is ready. Tells the
+   terminal which sensor was found, once. */
+static int ensure_sensor(void) {
+    if (!sensor_ready(1)) {
         cdc_write("Error: no supported magnetometer found. "
                   "Check wiring, try 'scan'.\r\n");
         return 0;
     }
+    if (s_announced)
+        return 1;
+    s_announced = 1;
     char buf[96];
     char *p = fmt_str(buf, "Sensor: ");
     p = fmt_str(p, mag_chip_name(&s_mag));
@@ -154,6 +140,9 @@ static char *fmt_sample(char *p) {
         p = fmt_str(p, mag_strerror(err));
         return fmt_str(p, "\r\n");
     }
+    s_last      = s;
+    s_have_last = 1;
+    s_last_tick = xTaskGetTickCount();
 
     /* 1 uT = 10 mG */
     int32_t heading_d10 = round_i32(mag_heading_deg(&s, 0.0f) * 10.0f) % 3600;
@@ -211,21 +200,6 @@ static void stream_sample(void) {
     char buf[128];
     *fmt_sample(buf) = '\0';
     print_async(buf);
-}
-
-/* Append v with 3 decimals: "1.012", "-0.987" */
-static char *fmt_fixed3(char *p, float v) {
-    int32_t m = round_i32(v * 1000.0f);
-    if (m < 0) {
-        *p++ = '-';
-        m = -m;
-    }
-    p = fmt_int(p, m / 1000, 0);
-    *p++ = '.';
-    *p++ = (char)('0' + m / 100 % 10);
-    *p++ = (char)('0' + m / 10 % 10);
-    *p++ = (char)('0' + m % 10);
-    return p;
 }
 
 /* ---- calibration ---- */
@@ -595,21 +569,88 @@ static void process_command(const char *line) {
     cdc_write("Unknown command. Type 'help'.\r\n");
 }
 
+/* ---- display ---- */
+
+static void display_tick(void) {
+    if (s_cal_active) {
+        int cover[3];
+        cal_coverage(cover);
+        int32_t left_ms = (int32_t)(s_cal_end - xTaskGetTickCount()) * portTICK_PERIOD_MS;
+        display_calibration(cover, (int)((left_ms + 999) / 1000));
+        return;
+    }
+    if (!sensor_ready(0)) {
+        display_message("No sensor", "check wiring");
+        return;
+    }
+    /* Use the reading just printed to the terminal if there is a fresh one */
+    if (!s_have_last ||
+        (int32_t)(xTaskGetTickCount() - s_last_tick) > (int32_t)pdMS_TO_TICKS(DISPLAY_MS)) {
+        mag_sample_t s;
+        int err = mag_read(&s_mag, &s);
+        if (err != MAG_OK) {
+            display_message("Read error", mag_strerror(err));
+            return;
+        }
+        s_last      = s;
+        s_have_last = 1;
+        s_last_tick = xTaskGetTickCount();
+    }
+    display_reading(&s_last, &s_mag);
+}
+
+/* Look for the display; set it up when one appears */
+static void display_check(void) {
+    if (!s_display && display_detect()) {
+        display_init();
+        s_display = 1;
+    }
+}
+
+/* Refresh the display if due, or look for one while there is none.
+   Returns ticks until the next time something is due. */
+static TickType_t display_due(void) {
+    int32_t left = (int32_t)(s_next_display - xTaskGetTickCount());
+    if (left <= 0) {
+        if (s_display) {
+            display_tick();
+            left = (int32_t)pdMS_TO_TICKS(DISPLAY_MS);
+        } else {
+            display_check();
+            left = (int32_t)pdMS_TO_TICKS(s_display ? DISPLAY_MS : DISPLAY_RETRY_MS);
+        }
+        s_next_display = xTaskGetTickCount() + (TickType_t)left;
+    }
+    return (TickType_t)left;
+}
+
+/* Wait for the host to open the terminal (DTR assert), keeping the display
+   going meanwhile: it works without a terminal. */
+static void wait_for_host(void) {
+    while (!g_cdc_connected) {
+        TickType_t wait = display_due();
+        vTaskDelay(wait < pdMS_TO_TICKS(100) ? wait + 1 : pdMS_TO_TICKS(100));
+    }
+}
+
 void ConsoleTask(void *pvParam) {
     (void)pvParam;
 
-    /* Wait for the host to open the terminal (DTR assert) */
-    while (!g_cdc_connected)
-        vTaskDelay(pdMS_TO_TICKS(100));
+    display_check();
+    wait_for_host();
 
-    cdc_write(BANNER "Type 'help' for commands.\r\n> ");
+    cdc_write(BANNER);
+    cdc_write(s_display ? "Display: connected\r\n"
+                        : "Display: not found (it is picked up when connected)\r\n");
+    cdc_write("Type 'help' for commands.\r\n> ");
 
     int last_cr = 0;   /* previous byte was '\r': swallow a following '\n' (CRLF) */
 
     for (;;) {
-        /* Block up to 200 ms between bytes (gives reconnect logic a chance
-           to run), or less if a streamed reading is due sooner. */
-        TickType_t wait = pdMS_TO_TICKS(200);
+        /* Block until the next display refresh (at most 200 ms, which also
+           gives the reconnect logic a chance to run), or less if a streamed
+           reading or a calibration sample is due sooner. */
+        TickType_t wait = display_due();
         if (s_cal_active && g_cdc_connected) {
             TickType_t next = cal_tick();
             if (next < wait)
@@ -637,8 +678,7 @@ void ConsoleTask(void *pvParam) {
         if (xQueueReceive(g_cdc_rx_queue, &ch, wait) != pdTRUE) {
             /* Timeout — check if host disconnected and reconnected */
             if (!g_cdc_connected) {
-                while (!g_cdc_connected)
-                    vTaskDelay(pdMS_TO_TICKS(100));
+                wait_for_host();
                 s_pos = 0;
                 cdc_write(BANNER "> ");
             }

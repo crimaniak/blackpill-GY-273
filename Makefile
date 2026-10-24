@@ -8,6 +8,8 @@ HAL_DRV    := $(ROOT)/Drivers/stm32f4xx-hal-driver
 FREERTOS   := $(ROOT)/Middlewares/FreeRTOS
 USB_LIB    := $(ROOT)/Middlewares/stm32_mw_usb_device
 
+SSD1306    := $(ROOT)/Lib/stm32-ssd1306/ssd1306
+
 I2C_MAGNETOMETER_DIR ?= $(ROOT)/Lib/i2c_magnetometer
 include $(I2C_MAGNETOMETER_DIR)/i2c_magnetometer.mk
 
@@ -22,6 +24,7 @@ INCLUDES := -I$(ROOT)/Inc \
             -I$(CMSIS)/Include \
             -I$(CMSIS_CORE) \
             -I$(HAL_DRV)/Inc \
+            -I$(SSD1306) \
             $(I2C_MAGNETOMETER_INCLUDES)
 
 DEFS     := -DSTM32F411xE -DUSE_HAL_DRIVER
@@ -45,7 +48,9 @@ PROJ_SRCS := $(ROOT)/Src/main.c \
              $(ROOT)/Src/usbd_desc.c \
              $(ROOT)/Src/usbd_cdc_if.c \
              $(ROOT)/Src/console.c \
-             $(ROOT)/Src/i2c_bus.c
+             $(ROOT)/Src/i2c_bus.c \
+             $(ROOT)/Src/fmt.c \
+             $(ROOT)/Src/display.c
 
 HAL_SRCS := $(HAL_DRV)/Src/stm32f4xx_hal.c \
             $(HAL_DRV)/Src/stm32f4xx_hal_cortex.c \
@@ -59,6 +64,7 @@ HAL_SRCS := $(HAL_DRV)/Src/stm32f4xx_hal.c \
             $(HAL_DRV)/Src/stm32f4xx_hal_pwr_ex.c \
             $(HAL_DRV)/Src/stm32f4xx_hal_rcc.c \
             $(HAL_DRV)/Src/stm32f4xx_hal_rcc_ex.c \
+            $(HAL_DRV)/Src/stm32f4xx_hal_spi.c \
             $(HAL_DRV)/Src/stm32f4xx_ll_usb.c
 
 RTOS_SRCS := $(FREERTOS)/tasks.c \
@@ -76,8 +82,9 @@ USB_SRCS := $(USB_LIB)/Core/Src/usbd_core.c \
 CMSIS_SRCS := $(CMSIS)/Source/Templates/system_stm32f4xx.c
 
 MAG_SRCS := $(I2C_MAGNETOMETER_SRCS) $(I2C_MAGNETOMETER_STM32_HAL_SRCS)
+OLED_SRCS := $(SSD1306)/ssd1306.c $(SSD1306)/ssd1306_fonts.c
 
-C_SRCS   := $(PROJ_SRCS) $(HAL_SRCS) $(RTOS_SRCS) $(USB_SRCS) $(CMSIS_SRCS) $(MAG_SRCS)
+C_SRCS   := $(PROJ_SRCS) $(HAL_SRCS) $(RTOS_SRCS) $(USB_SRCS) $(CMSIS_SRCS) $(MAG_SRCS) $(OLED_SRCS)
 ASM_SRCS := $(CMSIS)/Source/Templates/gcc/startup_stm32f411xe.s
 
 C_OBJS   := $(addprefix $(BUILD)/, $(notdir $(C_SRCS:.c=.o)))
@@ -93,7 +100,8 @@ VPATH := $(ROOT)/Src \
          $(USB_LIB)/Class/CDC/Src \
          $(CMSIS)/Source/Templates \
          $(CMSIS)/Source/Templates/gcc \
-         $(I2C_MAGNETOMETER_SRC_DIRS)
+         $(I2C_MAGNETOMETER_SRC_DIRS) \
+         $(SSD1306)
 
 .PHONY: all flash clean size
 

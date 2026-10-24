@@ -9,6 +9,7 @@
 #define HAL_PCD_MODULE_ENABLED
 #define HAL_PWR_MODULE_ENABLED
 #define HAL_RCC_MODULE_ENABLED
+#define HAL_SPI_MODULE_ENABLED
 
 #define HSE_VALUE               25000000U   /* Black Pill: 25 MHz crystal */
 #define HSE_STARTUP_TIMEOUT     100U
@@ -34,3 +35,4 @@
 #include "stm32f4xx_hal_flash.h"
 #include "stm32f4xx_hal_pwr.h"
 #include "stm32f4xx_hal_pcd.h"
+#include "stm32f4xx_hal_spi.h"

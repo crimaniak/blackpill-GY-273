@@ -5,9 +5,14 @@ QMC5883L clone) on a Black Pill board (STM32F411CEU6, 512 KiB flash,
 128 KiB SRAM, 25 MHz HSE). From a terminal you can scan the I2C bus, read the
 sensor once, or have it print readings at a fixed interval.
 
+An optional 0.96" OLED shows the heading and field strength, also without a
+terminal connected.
+
 The sensor is driven by the
-[i2c_magnetometer](https://github.com/crimaniak/i2c_magnetometer) library,
-included as a submodule. This project adds the USB console around it.
+[i2c_magnetometer](https://github.com/crimaniak/i2c_magnetometer) library and
+the display by [stm32-ssd1306](https://github.com/afiskon/stm32-ssd1306),
+both included as submodules. This project adds the USB console and the
+display screens around them.
 
 The board enumerates as `0483:5740` "GY-273 Magnetometer Console" (on Linux
 usually `/dev/ttyACM0`). Any terminal works, for example
@@ -27,6 +32,24 @@ effect.
 The bus runs at 100 kHz. The GY-273 has 4.7 kΩ pull-ups on SDA and SCL, so no
 external resistors are needed. The internal pull-ups are also enabled so an
 empty bus idles high.
+
+### Display (optional)
+
+A 0.96" 128x64 OLED with an SSD1306 or SSD1315 controller, 7-pin SPI version
+(for example JMD096-1315-W):
+
+| OLED | Black Pill | Notes |
+|---|---|---|
+| GND | G | |
+| VCC | 3V3 | The module has its own regulator |
+| D0 | PA5 | SPI1_SCK (AF5) |
+| D1 | PA7 | SPI1_MOSI (AF5) |
+| RES | PB1 | Reset, pulsed low at startup |
+| DC | PB0 | Command/data select |
+| CS | PA4 | Chip select |
+
+SPI1 runs at 6 MHz in mode 0. The display is optional and detected at
+startup (see [Display](#display)).
 
 ## Commands
 
@@ -117,6 +140,40 @@ Once a calibration is made with `cal start`, it is applied to all readings,
 including `|B|` and `heading`. The heading is only meaningful with the module
 held level. It is not tilt-compensated (there is no accelerometer) and not
 corrected for magnetic declination.
+
+## Display
+
+The display can't be read back over SPI, so the firmware detects it by its
+pull-up resistors instead. These modules have pull-ups on D0 and D1 (for
+their I2C mode). At startup the firmware reads both pins with the STM32's
+internal pull-downs:
+- **Both high:** a display is attached. The firmware sets up SPI and refreshes
+  it.
+- **Otherwise:** there is no display. The firmware sends no SPI traffic and
+  checks again every 2 seconds, so a display plugged in later is picked up
+  without a reset.
+
+The terminal banner shows the result (`Display: connected` or
+`Display: not found`). Unplugging a display while it is in use is not
+detected, because its pins are then driven by SPI; that takes a reset.
+
+The display refreshes 5 times a second. It works without a terminal open,
+so the board can run as a standalone compass on USB power.
+
+```
+ 223.0°  SW          heading (level, uncalibrated or calibrated) and compass point
+ |B| 550 mG     RAW  field strength; CAL once a calibration is applied
+ X -388 Y -364 Z  130     field per axis, mG
+ QMC5883L 50Hz DRDY       sensor, rate, DRDY status (or OVERFLOW)
+```
+
+During `cal start` it shows a bar per axis with how much of a full turn the
+axis has seen, and the seconds left. Without a sensor it shows `No sensor`.
+The heading on the display is the direction of the GY-273's X axis, so mount
+the module with its X arrow pointing where the display should point.
+
+When the terminal is printing readings, the display uses the latest of them;
+otherwise it reads the sensor itself.
 
 ## Calibration
 
@@ -209,7 +266,11 @@ by hand to free a slave holding SDA low, then the I2C peripheral is reset
 - `Src/main.c`: clocks, USB re-enumeration (PA12 low for 100 ms), I2C init, RTOS objects, console task
 - `Src/console.c`: command line, output formatting, streaming and calibration schedule, library setup (STM32 HAL port on I2C1, DRDY on PB5)
 - `Src/i2c_bus.c`: I2C1 setup on PB6/PB7, bus recovery, bus scan
+- `Src/display.c`: SPI1 setup and the display screens
+- `Src/fmt.c`: number formatting for console and display (the firmware has no printf)
+- `Inc/ssd1306_conf.h`: display driver configuration (pins, fonts)
 - `Lib/i2c_magnetometer`: the sensor library (submodule)
+- `Lib/stm32-ssd1306`: the display driver (submodule)
 - `Src/usbd_conf.c`, `Src/usbd_desc.c`, `Src/usbd_cdc_if.c`: USB device glue
 - `Src/stm32f4xx_it.c`: `SysTick_Handler` and `OTG_FS_IRQHandler`
 - `STM32F411CE_FLASH.ld`: linker script
@@ -232,6 +293,7 @@ All libraries are git submodules (`git clone --recurse-submodules`, or
 | `Drivers/cmsis-device-f4` | STMicroelectronics/cmsis-device-f4 | v2.6.11-3 (`9192c7b`) |
 | `Drivers/cmsis-core` | STMicroelectronics/cmsis-core | v5.9.0_20250520 |
 | `Lib/i2c_magnetometer` | crimaniak/i2c_magnetometer | main |
+| `Lib/stm32-ssd1306` | afiskon/stm32-ssd1306 | master (`25bd2e9`) |
 
 You also need `arm-none-eabi-gcc` and `st-flash` (stlink tools).
 
@@ -243,7 +305,8 @@ make flash      # st-flash write to 0x08000000, then reset
 make clean
 ```
 
-The firmware builds to about 39 KB of flash and 26 KB of RAM.
+The firmware builds to about 55 KB of flash (12 KB of it display fonts) and
+27 KB of RAM.
 
 ## Status
 
@@ -264,10 +327,16 @@ QMC5883L clone:
   tested on the board with simulated rotation data substituted for the
   sensor during collection. A real hand-rotated calibration is still to be
   done.
+- Display (JMD096-1315-W, SSD1315): shows the screens as intended. Detection
+  was tested connected at startup, not connected at startup (no SPI traffic,
+  everything else works), and plugged in later without a reset.
+- Loose GY-273 wire: readings resume by themselves when the connection is
+  restored (this used to need a `scan`, fixed in the library).
 
-In one early test run at 200 Hz there was a burst of read errors that looked
-like DRDY not being detected. It did not happen again in later runs, including
-the 200 rate changes above.
+During testing there were occasional single read errors and a few bursts of
+them at 200 Hz. The test module's wiring later turned out to be loose, which
+is the likely cause, but this is not proven. With the wiring fixed, 50 Hz and
+200 Hz runs were clean.
 
 The HMC5883L code path has been tested only against a simulated chip,
 because no module with a genuine HMC5883L was available.

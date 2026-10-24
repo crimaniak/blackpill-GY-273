@@ -85,3 +85,8 @@ long strtol(const char *s, char **endptr, int base) {
         *endptr = (*s != '\0' && s == start) ? (char *)s : (char *)s;
     return sign * result;
 }
+
+/* Used by the ssd1306 driver (line drawing) */
+int abs(int v) {
+    return v < 0 ? -v : v;
+}
