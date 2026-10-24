@@ -16,6 +16,12 @@
 #define MIN_INTERVAL_MS 5          /* 200 Hz, the fastest sensor rate */
 #define MAX_INTERVAL_MS 3600000    /* 1 hour */
 
+#define CAL_DEFAULT_S   30
+#define CAL_MAX_S       300
+#define CAL_SAMPLE_MS   20         /* collect at up to 50 samples/s */
+#define CAL_REPORT_MS   1000       /* progress line once a second */
+#define CAL_MIN_COVER   60         /* % of a full turn each axis must see */
+
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 static char       s_line[64];       /* command line being typed */
@@ -32,6 +38,12 @@ static mag_stm32_port_t s_port = {
 };
 static mag_bus_t s_bus;
 static mag_dev_t s_mag;
+
+/* Calibration in progress (cal start) */
+static int                 s_cal_active;
+static TickType_t          s_cal_end, s_cal_next_sample, s_cal_next_report;
+static mag_cal_collector_t s_cal;
+static float               s_cal_field_sum;   /* sum of |B|, uT, for coverage */
 
 /* Transmit over USB CDC. Data is copied into s_tx_buf after the previous
    transfer has finished, so callers may pass stack buffers. */
@@ -171,9 +183,23 @@ static void print_sample(void) {
     cdc_write(buf);
 }
 
-/* Print a streamed reading without mangling the line being typed: erase the
-   prompt, print the reading, then redraw the prompt and the partial input.
+/* Print text that was not asked for by a command (streamed readings,
+   calibration progress) without mangling the line being typed: erase the
+   prompt, print the text, then redraw the prompt and the partial input.
    All of it goes out in one write to keep up at high rates. */
+static void print_async(const char *text) {
+    char buf[320];
+    size_t n = strlen(text);
+    if (n > sizeof(buf) - sizeof(s_line) - 8)
+        n = sizeof(buf) - sizeof(s_line) - 8;
+    char *p = fmt_str(buf, "\r\x1b[K");
+    memcpy(p, text, n);
+    p = fmt_str(p + n, "> ");
+    memcpy(p, s_line, (size_t)s_pos);
+    p += s_pos;
+    cdc_write_raw((const uint8_t *)buf, (uint32_t)(p - buf));
+}
+
 static void stream_sample(void) {
     if (!s_mag.drv) {
         cdc_write("\r\x1b[K");
@@ -182,13 +208,215 @@ static void stream_sample(void) {
         cdc_write_raw((const uint8_t *)s_line, (uint32_t)s_pos);
         return;
     }
-    char buf[96 + sizeof(s_line) + 8];
-    char *p = fmt_str(buf, "\r\x1b[K");
-    p = fmt_sample(p);
-    p = fmt_str(p, "> ");
-    memcpy(p, s_line, (size_t)s_pos);
-    p += s_pos;
-    cdc_write_raw((const uint8_t *)buf, (uint32_t)(p - buf));
+    char buf[128];
+    *fmt_sample(buf) = '\0';
+    print_async(buf);
+}
+
+/* Append v with 3 decimals: "1.012", "-0.987" */
+static char *fmt_fixed3(char *p, float v) {
+    int32_t m = round_i32(v * 1000.0f);
+    if (m < 0) {
+        *p++ = '-';
+        m = -m;
+    }
+    p = fmt_int(p, m / 1000, 0);
+    *p++ = '.';
+    *p++ = (char)('0' + m / 100 % 10);
+    *p++ = (char)('0' + m / 10 % 10);
+    *p++ = (char)('0' + m % 10);
+    return p;
+}
+
+/* ---- calibration ---- */
+
+/* How much of a full turn each axis has seen, in %: its span compared with
+   the span of a full turn, 2 x the field strength. */
+static void cal_coverage(int cover[3]) {
+    float field = s_cal.count ? s_cal_field_sum / (float)s_cal.count : 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float span = s_cal.max[i] - s_cal.min[i];
+        int c = field > 0.0f ? (int)(span / (2.0f * field) * 100.0f) : 0;
+        cover[i] = c > 100 ? 100 : c;
+    }
+}
+
+static char *fmt_coverage(char *p) {
+    static const char axes[] = "XYZ";
+    int cover[3];
+    cal_coverage(cover);
+    for (int i = 0; i < 3; i++) {
+        *p++ = ' ';
+        *p++ = axes[i];
+        p = fmt_int(p, cover[i], 4);
+        *p++ = '%';
+    }
+    return p;
+}
+
+static void cal_sample(void) {
+    mag_sample_t s;
+    if (mag_read_uncalibrated(&s_mag, &s) != MAG_OK || (s.flags & MAG_FLAG_OVERFLOW))
+        return;
+    mag_cal_collect_add(&s_cal, &s);
+    s_cal_field_sum += mag_field_ut(&s);
+}
+
+static void cal_progress(void) {
+    int32_t left_ms = (int32_t)(s_cal_end - xTaskGetTickCount()) * portTICK_PERIOD_MS;
+    char buf[96];
+    char *p = fmt_str(buf, "Turning:");
+    p = fmt_coverage(p);
+    p = fmt_str(p, "   ");
+    p = fmt_int(p, (left_ms + 999) / 1000, 0);
+    p = fmt_str(p, " s left\r\n");
+    *p = '\0';
+    print_async(buf);
+}
+
+/* Append the calibration in effect, or a note that there is none */
+static char *fmt_calibration(char *p) {
+    static const char axes[] = "XYZ";
+    if (!s_mag.has_cal)
+        return fmt_str(p, "No calibration: readings are raw. Use 'cal start'.\r\n");
+    p = fmt_str(p, "  offset:");
+    for (int i = 0; i < 3; i++) {
+        *p++ = ' ';
+        *p++ = axes[i];
+        p = fmt_int(p, round_i32(s_mag.cal.offset[i] * 10.0f), 6);
+    }
+    p = fmt_str(p, " mG\r\n  scale: ");
+    for (int i = 0; i < 3; i++) {
+        *p++ = ' ';
+        *p++ = axes[i];
+        *p++ = ' ';
+        p = fmt_fixed3(p, s_mag.cal.matrix[i][i]);
+    }
+    return fmt_str(p, "\r\n");
+}
+
+/* Stop collecting and apply the result. Writes the report into p. */
+static char *cal_finish(char *p) {
+    int cover[3];
+    mag_calibration_t cal;
+
+    s_cal_active = 0;
+    cal_coverage(cover);
+    int enough = cover[0] >= CAL_MIN_COVER && cover[1] >= CAL_MIN_COVER &&
+                 cover[2] >= CAL_MIN_COVER;
+    if (!enough || mag_cal_collect_finish(&s_cal, &cal) != MAG_OK) {
+        p = fmt_str(p, "Calibration failed, not enough rotation:");
+        p = fmt_coverage(p);
+        p = fmt_str(p, " (need ");
+        p = fmt_int(p, CAL_MIN_COVER, 0);
+        p = fmt_str(p, "% each).\r\nTurn the module so that every axis points up and down. ");
+        return fmt_str(p, s_mag.has_cal ? "Previous calibration kept.\r\n"
+                                        : "Readings stay raw.\r\n");
+    }
+    mag_set_calibration(&s_mag, &cal);
+    p = fmt_str(p, "Calibration done (");
+    p = fmt_int(p, (int32_t)s_cal.count, 0);
+    p = fmt_str(p, " samples,");
+    p = fmt_coverage(p);
+    p = fmt_str(p, "), now applied to readings:\r\n");
+    p = fmt_calibration(p);
+    return fmt_str(p, "Check: '|B|' should now stay nearly constant as you turn the module.\r\n");
+}
+
+/* Called from the main loop while calibrating. Returns ticks until the
+   next thing to do. */
+static TickType_t cal_tick(void) {
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(s_cal_end - now) <= 0) {
+        char buf[320];
+        *cal_finish(buf) = '\0';
+        print_async(buf);
+        return pdMS_TO_TICKS(200);
+    }
+    if ((int32_t)(s_cal_next_sample - now) <= 0) {
+        cal_sample();   /* may wait up to one sensor period for DRDY */
+        s_cal_next_sample = xTaskGetTickCount() + pdMS_TO_TICKS(CAL_SAMPLE_MS);
+    }
+    if ((int32_t)(s_cal_next_report - now) <= 0) {
+        cal_progress();
+        s_cal_next_report += pdMS_TO_TICKS(CAL_REPORT_MS);
+    }
+    int32_t left = (int32_t)(s_cal_next_sample - xTaskGetTickCount());
+    return left > 0 ? (TickType_t)left : 0;
+}
+
+static void cmd_cal(const char *arg) {
+    while (*arg == ' ') arg++;
+
+    if (*arg == '\0') {
+        char buf[160];
+        char *p = buf;
+        if (s_cal_active)
+            p = fmt_str(p, "Calibration in progress ('cal stop' to finish).\r\n");
+        *fmt_calibration(p) = '\0';
+        cdc_write(buf);
+        return;
+    }
+
+    if (strcmp(arg, "stop") == 0) {
+        if (!s_cal_active) {
+            cdc_write("Not calibrating.\r\n");
+            return;
+        }
+        char buf[320];
+        *cal_finish(buf) = '\0';
+        cdc_write(buf);
+        return;
+    }
+
+    if (strcmp(arg, "clear") == 0) {
+        s_cal_active = 0;
+        mag_set_calibration(&s_mag, NULL);
+        cdc_write("Calibration cleared, readings are raw.\r\n");
+        return;
+    }
+
+    if (strcmp(arg, "start") == 0 || strncmp(arg, "start ", 6) == 0) {
+        long secs = CAL_DEFAULT_S;
+        const char *a = arg + 5;
+        while (*a == ' ') a++;
+        if (*a) {
+            char *end;
+            secs = strtol(a, &end, 10);
+            while (*end == ' ') end++;
+            if (end == a || *end != '\0' || secs < 5 || secs > CAL_MAX_S) {
+                cdc_write("Usage: cal start [N]   N = seconds, 5-300 (default 30)\r\n");
+                return;
+            }
+        }
+        if (!ensure_sensor())
+            return;
+        if (s_interval) {
+            s_interval = 0;
+            cdc_write("Printing readings stopped.\r\n");
+        }
+        mag_cal_collect_begin(&s_cal);
+        s_cal_field_sum   = 0.0f;
+        s_cal_active      = 1;
+        TickType_t now    = xTaskGetTickCount();
+        s_cal_end         = now + pdMS_TO_TICKS((uint32_t)secs * 1000U);
+        s_cal_next_sample = now;
+        s_cal_next_report = now + pdMS_TO_TICKS(CAL_REPORT_MS);
+
+        char buf[320];
+        char *p = fmt_str(buf, "Calibrating for ");
+        p = fmt_int(p, (int32_t)secs, 0);
+        p = fmt_str(p, " s. Slowly turn the module through all orientations:\r\n"
+                       "  a full turn flat, a full turn on its side, then on another side,\r\n"
+                       "  and slow figure-eights. Each axis should reach 100%.\r\n"
+                       "Keep it away from steel objects that will not move with it.\r\n"
+                       "'cal stop' finishes early.\r\n");
+        *p = '\0';
+        cdc_write(buf);
+        return;
+    }
+
+    cdc_write("Usage: cal [start [N] | stop | clear]\r\n");
 }
 
 /* Append an interval as "3 s" or "250 ms". */
@@ -252,6 +480,10 @@ static void cmd_start(const char *arg) {
                       "       start Nms     every N milliseconds (5-3600000)\r\n");
             return;
         }
+    }
+    if (s_cal_active) {
+        cdc_write("Calibration in progress, 'cal stop' first.\r\n");
+        return;
     }
     if (!ensure_sensor())
         return;
@@ -321,6 +553,10 @@ static void process_command(const char *line) {
                   "  start Nms   print readings every N milliseconds (5-3600000)\r\n"
                   "  stop        stop printing readings\r\n"
                   "  rate [HZ]   show or set the sensor rate (closest supported)\r\n"
+                  "  cal         show the calibration\r\n"
+                  "  cal start [N]  calibrate: turn the module for N s (default 30)\r\n"
+                  "  cal stop    finish calibrating early\r\n"
+                  "  cal clear   remove the calibration (raw readings)\r\n"
                   "  help        this help\r\n");
         return;
     }
@@ -342,6 +578,11 @@ static void process_command(const char *line) {
 
     if (strcmp(line, "rate") == 0 || strncmp(line, "rate ", 5) == 0) {
         cmd_rate(line + 4);
+        return;
+    }
+
+    if (strcmp(line, "cal") == 0 || strncmp(line, "cal ", 4) == 0) {
+        cmd_cal(line + 3);
         return;
     }
 
@@ -369,7 +610,11 @@ void ConsoleTask(void *pvParam) {
         /* Block up to 200 ms between bytes (gives reconnect logic a chance
            to run), or less if a streamed reading is due sooner. */
         TickType_t wait = pdMS_TO_TICKS(200);
-        if (s_interval && g_cdc_connected) {
+        if (s_cal_active && g_cdc_connected) {
+            TickType_t next = cal_tick();
+            if (next < wait)
+                wait = next;
+        } else if (s_interval && g_cdc_connected) {
             TickType_t now  = xTaskGetTickCount();
             int32_t    left = (int32_t)(s_next_sample - now);
             if (left <= 0) {

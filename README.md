@@ -38,6 +38,10 @@ empty bus idles high.
 | `start Nms` | Print a reading every N milliseconds (5-3600000) |
 | `stop` | Stop printing readings |
 | `rate [HZ]` | Show or set the sensor's output rate. The closest rate the chip supports is used: 10/50/100/200 Hz on a QMC5883L (default 50), 0.75-75 Hz on an HMC5883L (default 15) |
+| `cal` | Show the calibration in effect |
+| `cal start [N]` | Calibrate: turn the module through all orientations for N seconds (5-300, default 30) |
+| `cal stop` | Finish calibrating early |
+| `cal clear` | Remove the calibration; readings are raw again |
 | `help` | Show the command list |
 
 `start` while already running changes the interval. Readings are printed on
@@ -109,9 +113,50 @@ Stopped.
 | `heading` | `atan2(Y, X)` in degrees, 0-360 |
 | `OVERFLOW` | Shown when an axis is saturated, for example with a magnet nearby |
 
-The heading is only meaningful with the module held level. It is not
-tilt-compensated, not hard/soft-iron calibrated, and not corrected for
-magnetic declination.
+Once a calibration is made with `cal start`, it is applied to all readings,
+including `|B|` and `heading`. The heading is only meaningful with the module
+held level. It is not tilt-compensated (there is no accelerometer) and not
+corrected for magnetic declination.
+
+## Calibration
+
+Everything fixed near the sensor (the board, wires, the USB cable, screws, a
+case) adds its own field or bends the Earth's. That shifts and stretches the
+readings and skews the heading. Calibration measures this and corrects it.
+
+1. **Mount the module where it will stay.** Calibration is only valid for
+   the surroundings it was made in. Keep away from large steel objects that
+   won't travel with the module, such as a steel desk frame or a PC case.
+2. **Run `cal start`** (30 s, or `cal start N`) and slowly turn the module
+   through all orientations: a full turn flat, a full turn on its side, then
+   on another side, and slow figure-eights.
+3. **Watch the progress line,** printed once a second. For each axis it
+   shows how much of a full turn the axis has seen. Keep turning until all
+   three are near 100%:
+   ```
+   Turning: X 100% Y  87% Z  41%   12 s left
+   ```
+   A low Z usually means the module was only turned flat.
+4. **When time is up,** or after `cal stop`, the result is printed and
+   applied:
+   ```
+   Calibration done (1480 samples, X 100% Y  97% Z  95%), now applied to readings:
+     offset: X  -106 Y    51 Z   200 mG
+     scale:  X 0.894 Y 1.067 Z 1.059
+   ```
+   If an axis stayed below 60%, the calibration is rejected and the previous
+   one, if any, stays in effect.
+5. **Check:** run `start 200ms` and turn the module. `|B|` should now stay
+   nearly constant in every direction.
+
+Starting a calibration stops `start` printing, and `start` is refused while
+calibrating. The calibration is kept in RAM only, so it is lost on reset or
+power-off; run it again after that.
+
+The method is min/max: offsets (hard iron) and per-axis scale (simplified
+soft iron), from the library's `mag_cal_collect_*` functions. It does not
+correct distortion skewed between the axes, which needs a full ellipsoid
+fit.
 
 ## Sensor support
 
@@ -162,7 +207,7 @@ by hand to free a slave holding SDA low, then the I2C peripheral is reset
 ## Layout
 
 - `Src/main.c`: clocks, USB re-enumeration (PA12 low for 100 ms), I2C init, RTOS objects, console task
-- `Src/console.c`: command line, output formatting, streaming schedule, library setup (STM32 HAL port on I2C1, DRDY on PB5)
+- `Src/console.c`: command line, output formatting, streaming and calibration schedule, library setup (STM32 HAL port on I2C1, DRDY on PB5)
 - `Src/i2c_bus.c`: I2C1 setup on PB6/PB7, bus recovery, bus scan
 - `Lib/i2c_magnetometer`: the sensor library (submodule)
 - `Src/usbd_conf.c`, `Src/usbd_desc.c`, `Src/usbd_cdc_if.c`: USB device glue
@@ -198,7 +243,7 @@ make flash      # st-flash write to 0x08000000, then reset
 make clean
 ```
 
-The firmware builds to about 35 KB of flash and 26 KB of RAM.
+The firmware builds to about 39 KB of flash and 26 KB of RAM.
 
 ## Status
 
@@ -213,6 +258,12 @@ QMC5883L clone:
 - 40 of 40 back-to-back rate changes (each a full sensor reset and setup)
   were followed by a good reading, with and without DRDY.
 - Without DRDY, see [Data ready](#data-ready-drdy).
+- Calibration commands: rejecting too little rotation (module lying still),
+  `cal stop`, `cal clear`, and their interplay with `start` were tested on
+  the board. The success path (report, applying the result to readings) was
+  tested on the board with simulated rotation data substituted for the
+  sensor during collection. A real hand-rotated calibration is still to be
+  done.
 
 In one early test run at 200 Hz there was a burst of read errors that looked
 like DRDY not being detected. It did not happen again in later runs, including

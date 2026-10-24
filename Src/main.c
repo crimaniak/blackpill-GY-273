@@ -56,7 +56,7 @@ int main(void) {
     xSemaphoreGive(g_cdc_tx_done);   /* mark as initially available */
 
     /* Only ConsoleTask needed — USB is fully interrupt-driven */
-    xTaskCreate(ConsoleTask, "CON", 512, NULL, 2, NULL);
+    xTaskCreate(ConsoleTask, "CON", 768, NULL, 2, NULL);
 
     vTaskStartScheduler();
     for (;;);
